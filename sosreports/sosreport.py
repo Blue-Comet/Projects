@@ -12,6 +12,7 @@ import json
 import tarfile
 import argparse
 import datetime
+import html
 from pathlib import Path
 
 
@@ -137,6 +138,7 @@ class SOSReportParser:
                 "aws_metadata_instance-type.txt": ["sos_commands/aws/aws_metadata_instance-type.txt"],
                 "aws_metadata_placement_availability-zone-id.txt": ["sos_commands/aws/aws_metadata_placement_availability-zone-id.txt"],
                 "aws_metadata_hostname.txt": ["sos_commands/aws/aws_metadata_hostname.txt"],
+                "auth_log": ["var/log/auth.log", "var/log/secure", "var/log/auth.log.1"],
             }
 
             for key, candidates in target_map.items():
@@ -621,6 +623,9 @@ class SOSReportParser:
                 
                 is_interactive = not (shell.endswith("nologin") or shell.endswith("false") or shell == "/bin/sync")
                 is_regular = (uid_int == 0) or (1000 <= uid_int < 65534)
+                pwd_lock = meta.get("pwd_lock", "0")
+                pwd_deny = meta.get("pwd_deny", "1")
+                is_active = is_interactive and (pwd_lock != "1")
                 
                 has_sudo = (user in sudo_users) or (uid_int == 0)
                 sudo_rule = sudo_users.get(user, "Superuser (Root)" if uid_int == 0 else "")
@@ -633,14 +638,17 @@ class SOSReportParser:
                     "home": home,
                     "shell": shell,
                     "is_interactive": is_interactive,
+                    "is_active": is_active,
                     "is_regular": is_regular,
                     "has_sudo": has_sudo,
                     "sudo_rule": sudo_rule,
+                    "pwd_deny": pwd_deny,
+                    "pwd_lock": pwd_lock,
                     "proc_count": meta.get("proc", "0"),
                     "last_login": meta.get("last_login", "-")
                 })
 
-        users.sort(key=lambda u: (not u["has_sudo"], not u["is_regular"], not u["is_interactive"], u["uid"]))
+        users.sort(key=lambda u: (not u["has_sudo"], not u["is_regular"], not u.get("is_active", False), not u["is_interactive"], u["uid"]))
         self.data["users"] = users
 
     def _parse_ssh(self):
@@ -655,6 +663,26 @@ class SOSReportParser:
                 k, v = parts[0].lower(), parts[1].strip()
                 if k not in cfg:
                     cfg[k] = v
+
+        # Parse auth.log / secure for recent SSH login records
+        auth_text = self.raw_files.get("auth_log", "")
+        ssh_logins = {}
+        pattern = re.compile(
+            r"([A-Z][a-z]{2}\s+\d+\s+[\d:]+)\s+.*sshd\[\d+\]:\s+Accepted\s+(publickey|password)\s+for\s+(\S+)\s+from\s+(\S+)(?:\s+port\s+\d+)?(?:\s+ssh2)?(?::\s+([^\n]+))?"
+        )
+        for line in auth_text.splitlines():
+            m = pattern.search(line)
+            if m:
+                d_str, method, user, ip, key_info = m.groups()
+                if user not in ssh_logins:
+                    ssh_logins[user] = []
+                ssh_logins[user].append({
+                    "date": d_str,
+                    "method": method,
+                    "ip": ip,
+                    "key_info": (key_info or "").strip()
+                })
+
         self.data["ssh_config"] = {
             "port": cfg.get("port", "22"),
             "passwordauthentication": cfg.get("passwordauthentication", "unknown"),
@@ -663,6 +691,7 @@ class SOSReportParser:
             "maxauthtries": cfg.get("maxauthtries", "6"),
             "clientaliveinterval": cfg.get("clientaliveinterval", "0"),
             "x11forwarding": cfg.get("x11forwarding", "no"),
+            "ssh_logins": ssh_logins,
             "raw": cfg
         }
 
@@ -687,7 +716,7 @@ class SOSReportParser:
                         chunks = status_all.split("● ")
                         for ch in chunks:
                             if ch.startswith(unit_name):
-                                detail_log = ch.strip()[:1200]
+                                detail_log = ch.strip()
                                 break
                     failed_units.append({
                         "unit": unit_name,
@@ -702,7 +731,7 @@ class SOSReportParser:
         # Boot blame
         blame_text = self.raw_files.get("systemd-analyze_blame", "")
         blame_list = []
-        for line in blame_text.splitlines()[:15]:
+        for line in blame_text.splitlines():
             parts = line.strip().split(None, 1)
             if len(parts) == 2:
                 if "motd" in parts[1].lower():
@@ -894,7 +923,7 @@ class SOSReportParser:
             line_s = line.strip()
             if line_s and not line_s.startswith("multicast") and not line_s.startswith("broadcast"):
                 routes.append(line_s)
-        self.data["network"]["routes"] = routes[:10]
+        self.data["network"]["routes"] = routes
 
         # Netstat listening & active connections
         netstat_text = self.raw_files.get("netstat", "")
@@ -968,15 +997,7 @@ class SOSReportParser:
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip()
-                if k in [
-                    "net.core.somaxconn",
-                    "vm.swappiness",
-                    "fs.file-max",
-                    "net.ipv4.ip_forward",
-                    "net.ipv4.tcp_max_syn_backlog",
-                    "vm.max_map_count",
-                    "fs.inotify.max_user_watches"
-                ]:
+                if k:
                     sysctl_params[k] = v
         self.data["sysctl"] = sysctl_params
 
@@ -1025,10 +1046,10 @@ class SOSReportParser:
                         "cmd": cmd
                     })
 
-        self.data["processes"]["all"] = procs[:50]
+        self.data["processes"]["all"] = procs
         self.data["processes"]["total_count"] = len(procs)
-        self.data["processes"]["top_cpu"] = sorted(procs, key=lambda x: x["cpu"], reverse=True)[:10]
-        self.data["processes"]["top_mem"] = sorted(procs, key=lambda x: x["mem"], reverse=True)[:10]
+        self.data["processes"]["top_cpu"] = sorted(procs, key=lambda x: x["cpu"], reverse=True)
+        self.data["processes"]["top_mem"] = sorted(procs, key=lambda x: x["mem"], reverse=True)
 
     def _parse_logs(self):
         dmesg_text = self.raw_files.get("dmesg_-T") or self.raw_files.get("dmesg", "")
@@ -1052,7 +1073,18 @@ class SOSReportParser:
                 if "0 errors" in line_lower or "error_injection" in line_lower or "motd" in line_lower:
                     continue
                 dmesg_lines.append(line.strip())
-        self.data["dmesg_issues"] = dmesg_lines[:40]
+
+        def log_severity_rank(line: str) -> int:
+            ll = line.lower()
+            if any(k in ll for k in ("panic", "oom", "segfault", "fatal", "alert", "emerg", "error", "crit", "corrupt")):
+                return 0  # Critical / Error
+            if any(k in ll for k in ("failed", "fail", "warn", "warning", "taint", "vulnerab")):
+                return 1  # Warning
+            return 2      # Info
+
+        dmesg_lines.sort(key=log_severity_rank)
+        self.data["dmesg_issues"] = dmesg_lines
+        self.data["dmesg_raw"] = dmesg_text
 
         journal_text = self.raw_files.get("journalctl_--no-pager_--boot", "")
         journal_lines = []
@@ -1071,7 +1103,10 @@ class SOSReportParser:
                 if "0 failed" in line_lower or "no error" in line_lower or "uncompressed size" in line_lower:
                     continue
                 journal_lines.append(line.strip())
-        self.data["journal_issues"] = journal_lines[:40]
+
+        journal_lines.sort(key=log_severity_rank)
+        self.data["journal_issues"] = journal_lines
+        self.data["journal_raw"] = journal_text
 
         self.data["log_audit"] = {
             "oom_count": oom_count,
@@ -1083,7 +1118,7 @@ class SOSReportParser:
         # Last logins
         last_text = self.raw_files.get("last", "")
         logins = []
-        for line in last_text.splitlines()[:12]:
+        for line in last_text.splitlines():
             parts = line.strip().split()
             if len(parts) >= 4 and not line.startswith("wtmp begins"):
                 user = parts[0]
@@ -1107,6 +1142,122 @@ class SOSReportParser:
             }
         else:
             self.data["nginx"] = {"detected": False}
+
+        # Core Running Services & Daemon Stack Detection
+        core_services = []
+        ps_text = self.raw_files.get("ps", "")
+        net_ports = [str(p.get("port", "")) for p in self.data.get("network", {}).get("listening_ports", [])]
+
+        # 1. SSH Server
+        ssh_cfg = self.data.get("ssh_config", {})
+        ssh_port = ssh_cfg.get("port", "22")
+        pwd_auth = ssh_cfg.get("passwordauthentication", "no").lower()
+        hostname = str(self.data.get("system", {}).get("hostname", "")).lower()
+        is_bastion = "bastion" in hostname or "bastion" in self.archive_path.name.lower()
+        self.data["is_bastion"] = is_bastion
+
+        if is_bastion:
+            ssh_role_ko = "원격 보안 관리 배스천 터널링 데몬"
+            ssh_role_en = "Remote Secure Bastion Access & Tunneling"
+            ssh_badge = "badge-success"
+            ssh_note_ko = f"원격 터널링 및 배스천 접속 엔드포인트 - 포트 {ssh_port} (정상 구동)"
+            ssh_note_en = f"Remote bastion tunneling access endpoint - Port {ssh_port} (Active)"
+        else:
+            ssh_role_ko = "원격 터미널 및 SSH 접속 데몬"
+            ssh_role_en = "Remote Terminal & SSH Access Daemon"
+            if pwd_auth == "yes":
+                ssh_badge = "badge-warning"
+                ssh_note_ko = f"비밀번호 인증 활성화 (보안 점검 권장) - 포트 {ssh_port}"
+                ssh_note_en = f"Password Authentication Enabled (Audit Recommended) - Port {ssh_port}"
+            else:
+                ssh_badge = "badge-success"
+                ssh_note_ko = f"공개키 전용 보안 인증 적용됨 - 포트 {ssh_port}"
+                ssh_note_en = f"Pubkey Only Hardened - Port {ssh_port}"
+
+        core_services.append({
+            "name": "OpenSSH Server (sshd)",
+            "role_ko": ssh_role_ko,
+            "role_en": ssh_role_en,
+            "port": f"{ssh_port}/tcp (커스텀 포트)" if ssh_port != "22" else "22/tcp",
+            "status_ko": "활성 실행 중 (Active)",
+            "status_en": "Active (Running)",
+            "badge": ssh_badge,
+            "note_ko": ssh_note_ko,
+            "note_en": ssh_note_en
+        })
+
+        # 2. Nginx
+        if self.data["nginx"].get("detected") or "80" in net_ports:
+            v_str = self.data["nginx"].get("version", "Installed")
+            core_services.append({
+                "name": "Nginx Web & Reverse Proxy",
+                "role_ko": "HTTP 인그레스 리버스 프록시 및 웹 서버",
+                "role_en": "HTTP Ingress Reverse Proxy & Web Server",
+                "port": "80/tcp",
+                "status_ko": "활성 실행 중 (Active)",
+                "status_en": "Active (Running)",
+                "badge": "badge-success",
+                "note_ko": f"버전: {v_str} (SSL / HTTP2 지원)",
+                "note_en": f"Version: {v_str} (SSL / HTTP2 enabled)"
+            })
+
+        # 3. Datadog Agent
+        if "datadog-agent" in ps_text or "5000" in net_ports or "5001" in net_ports:
+            core_services.append({
+                "name": "Datadog Agent & Trace APM",
+                "role_ko": "클라우드 APM 트레이스 및 시스템 모니터링",
+                "role_en": "Cloud APM Trace & Metrics Collector",
+                "port": "5000, 5001/tcp (Local IPC)",
+                "status_ko": "활성 실행 중 (Active)",
+                "status_en": "Active (Running)",
+                "badge": "badge-primary",
+                "note_ko": "트레이스 에이전트 및 프로세스 에이전트 구동 중",
+                "note_en": "Trace agent & process monitoring running"
+            })
+
+        # 4. Prometheus Node Exporter
+        if "node_exporter" in ps_text or "9100" in net_ports:
+            core_services.append({
+                "name": "Prometheus Node Exporter",
+                "role_ko": "호스트 하드웨어 & OS 메트릭 익스포터",
+                "role_en": "Hardware & OS Metrics Exporter",
+                "port": "9100/tcp6",
+                "status_ko": "활성 실행 중 (Active)",
+                "status_en": "Active (Running)",
+                "badge": "badge-primary",
+                "note_ko": "프로메테우스 스크랩 엔드포인트 활성",
+                "note_en": "Prometheus scrape endpoint active"
+            })
+
+        # 5. Promtail Log Shipper
+        if "promtail" in ps_text or "9080" in net_ports or "45257" in net_ports:
+            core_services.append({
+                "name": "Grafana Promtail",
+                "role_ko": "중앙 집중식 저널 및 시스템 로그 전송기",
+                "role_en": "Centralized System Log Shipper (Loki)",
+                "port": "9080, 45257/tcp6",
+                "status_ko": "활성 실행 중 (Active)",
+                "status_en": "Active (Running)",
+                "badge": "badge-primary",
+                "note_ko": "Loki 대상 시스템/부팅 로그 실시간 스트리밍",
+                "note_en": "Streaming system & boot logs to Grafana Loki"
+            })
+
+        # 6. systemd-resolved
+        if "53" in net_ports or "systemd-resolve" in ps_text:
+            core_services.append({
+                "name": "systemd-resolved",
+                "role_ko": "네트워크 DNS Stub 캐싱 및 질의 리졸버",
+                "role_en": "Network DNS Stub Caching Resolver",
+                "port": "53/tcp (127.0.0.53)",
+                "status_ko": "활성 실행 중 (Active)",
+                "status_en": "Active (Running)",
+                "badge": "badge-secondary",
+                "note_ko": "로컬 DNS 캐싱 및 라우팅 도메인 처리",
+                "note_en": "Local DNS caching and domain resolution"
+            })
+
+        self.data["core_services"] = core_services
 
     def _evaluate_health(self):
         findings = []
@@ -1261,26 +1412,56 @@ class SOSReportParser:
         ssh_cfg = self.data.get("ssh_config", {})
         pwd_auth = ssh_cfg.get("passwordauthentication", "").lower()
         ssh_port = ssh_cfg.get("port", "22")
-        if pwd_auth == "yes":
-            score -= 10
-            findings.append({
-                "severity": "warning",
-                "title_en": f"SSH Password Authentication Enabled (Port {ssh_port})",
-                "title_ko": f"SSH 비밀번호 인증 활성화 (포트 {ssh_port})",
-                "desc_en": f"sshd allows password-based authentication (`PasswordAuthentication yes`). EC2 Bastion hosts should enforce key-based access to mitigate brute-force credential stuffing.",
-                "desc_ko": f"SSH 데몬 설정에서 비밀번호 인증이 허용되어 있습니다 (`PasswordAuthentication yes`). EC2 배스천 호스트의 무차별 대입 공격을 차단하기 위해 공개키 인증 전용으로 제한해야 합니다.",
-                "rec_en": "Edit `/etc/ssh/sshd_config` and set `PasswordAuthentication no`, then reload sshd.",
-                "rec_ko": "`/etc/ssh/sshd_config` 파일에서 `PasswordAuthentication no`로 변경한 후 sshd 서비스를 재시작하세요."
-            })
-        elif pwd_auth == "no":
+        is_bastion = self.data.get("is_bastion", False)
+
+        if is_bastion:
+            # Bastion 서버의 경우 패스워드 인증 경고를 제외하고 배스천 터널링 서비스 정상 구동으로 평가
             findings.append({
                 "severity": "success",
-                "title_en": "SSH Hardened (Key-based Authentication Only)",
-                "title_ko": "SSH 보안 강화 (공개키 전용 인증 적용됨)",
-                "desc_en": f"Password authentication is disabled on port {ssh_port}. Only authenticated keys are permitted.",
-                "desc_ko": f"포트 {ssh_port}에서 비밀번호 인증이 비활성화되어 안전하게 키 기반 인증만 허용됩니다.",
-                "rec_en": "Maintain private key access controls and rotate authorized keys periodically.",
-                "rec_ko": "접속용 개인키 보안을 유지하고 정기적으로 승인 키를 로테이션하세요."
+                "title_en": f"SSH Bastion Service Operational (Port {ssh_port})",
+                "title_ko": f"SSH 배스천 서비스 정상 동작 (포트 {ssh_port})",
+                "desc_en": f"OpenSSH daemon is actively running on port {ssh_port} for secure bastion remote access and administrative tunneling.",
+                "desc_ko": f"OpenSSH 데몬이 포트 {ssh_port}에서 정상적으로 실행 중이며 배스천 원격 접속 및 터널링 관리를 제공합니다.",
+                "rec_en": "Maintain network security group and firewall access controls for the bastion host.",
+                "rec_ko": "배스천 호스트의 인바운드 보안 그룹(Security Group) 및 방화벽 접근 제어를 유지 관리하세요."
+            })
+        else:
+            # Bastion 서버가 아닌 일반 서버는 패스워드 로그인 활성화 시 보안 위험으로 진단 (-10점)
+            if pwd_auth == "yes":
+                score -= 10
+                findings.append({
+                    "severity": "warning",
+                    "title_en": f"SSH Password Authentication Enabled (Port {ssh_port})",
+                    "title_ko": f"SSH 비밀번호 인증 활성화 (포트 {ssh_port})",
+                    "desc_en": f"sshd allows password-based authentication (`PasswordAuthentication yes`). Internal application and database hosts should enforce key-based access to mitigate brute-force credential stuffing.",
+                    "desc_ko": f"SSH 데몬 설정에서 비밀번호 인증이 허용되어 있습니다 (`PasswordAuthentication yes`). 일반 내부 서버 및 인스턴스는 무차별 대입 공격 차단을 위해 공개키 인증 전용으로 제한해야 합니다.",
+                    "rec_en": "Edit `/etc/ssh/sshd_config` and set `PasswordAuthentication no`, then reload sshd.",
+                    "rec_ko": "`/etc/ssh/sshd_config` 파일에서 `PasswordAuthentication no`로 변경한 후 sshd 서비스를 재시작하세요."
+                })
+            elif pwd_auth == "no":
+                findings.append({
+                    "severity": "success",
+                    "title_en": f"SSH Hardened (Key-based Authentication Only, Port {ssh_port})",
+                    "title_ko": f"SSH 보안 강화 (공개키 전용 인증 적용됨, 포트 {ssh_port})",
+                    "desc_en": f"Password authentication is disabled on port {ssh_port}. Only authenticated keys are permitted.",
+                    "desc_ko": f"포트 {ssh_port}에서 비밀번호 인증이 비활성화되어 안전하게 키 기반 인증만 허용됩니다.",
+                    "rec_en": "Maintain private key access controls and rotate authorized keys periodically.",
+                    "rec_ko": "접속용 개인키 보안을 유지하고 정기적으로 승인 키를 로테이션하세요."
+                })
+
+        # Sudoers Excessive Privileges Audit
+        sudo_users_list = [u["username"] for u in self.data.get("users", []) if u.get("has_sudo") and u["username"] != "root"]
+        if len(sudo_users_list) >= 5:
+            score -= 5
+            users_sample = ", ".join(sudo_users_list[:8]) + (f" 외 {len(sudo_users_list)-8}명" if len(sudo_users_list) > 8 else "")
+            findings.append({
+                "severity": "warning",
+                "title_en": f"Elevated Sudoers Accounts Count ({len(sudo_users_list)} users with sudo)",
+                "title_ko": f"다수의 관리자(Sudo) 권한 보유 계정 감지 ({len(sudo_users_list)}개 계정)",
+                "desc_en": f"A total of {len(sudo_users_list)} non-root user accounts have full sudo privileges: {users_sample}. EC2 Bastion instances should enforce the Principle of Least Privilege (PoLP).",
+                "desc_ko": f"root 외 {len(sudo_users_list)}개의 사용자 계정에 관리자(sudo) 권한이 부여되어 있습니다: {users_sample}. 배스천 호스트의 침해 위험을 줄이기 위해 최소 권한 원칙(PoLP) 적용이 필요합니다.",
+                "rec_en": "Review `/etc/sudoers.d/` and restrict sudo access only to designated system administrators.",
+                "rec_ko": "`/etc/sudoers.d/` 설정을 검토하여 실제 권한이 필요한 인원에게만 선별적으로 sudo 권한을 부여하세요."
             })
 
         # 7. Inode Capacity Health
@@ -1338,8 +1519,9 @@ class SOSReportParser:
 
 
 class HTMLReportGenerator:
-    def __init__(self, data):
+    def __init__(self, data, raw_files=None):
         self.d = data
+        self.raw_files = raw_files or {}
 
     def generate(self) -> str:
         score = self.d["health_score"]
@@ -1349,6 +1531,24 @@ class HTMLReportGenerator:
         status_key = "status_healthy" if score >= 85 else ("status_attention" if score >= 65 else "status_critical")
 
         json_dump = json.dumps(self.d, indent=2, ensure_ascii=False)
+
+        # Prepare Diagnostic Raw Files for Tab 8
+        raw_files_clean = {}
+        for k, v in sorted(self.raw_files.items()):
+            if isinstance(v, str):
+                raw_files_clean[k] = v
+            elif isinstance(v, dict):
+                raw_files_clean[k] = json.dumps(v, indent=2, ensure_ascii=False)
+
+        raw_options = []
+        for k in sorted(raw_files_clean.keys()):
+            content_str = raw_files_clean[k]
+            lines_cnt = len(content_str.splitlines())
+            kb_sz = round(len(content_str) / 1024, 1)
+            raw_options.append(f'<option value="{k}">{k} ({lines_cnt} lines, {kb_sz} KB)</option>')
+        raw_options_html = "\n".join(raw_options)
+
+        raw_files_json = json.dumps(raw_files_clean, ensure_ascii=False).replace("</script>", "<\\/script>")
 
         src = self.d.get("source_paths", {})
         def make_ref_badge(path_str):
@@ -1370,7 +1570,7 @@ class HTMLReportGenerator:
         ref_net = f"{src.get('ip_addr', 'sos_commands/networking/ip_-o_addr')}, {src.get('ip_route', 'sos_commands/networking/ip_route')}"
         ref_ports = src.get('netstat', 'sos_commands/networking/netstat_-W_-neopa')
         ref_connections = src.get('netstat', 'sos_commands/networking/netstat_-W_-neopa')
-        ref_ssh = src.get('sshd_-T', 'sos_commands/ssh/sshd_-T')
+        ref_ssh = f"{src.get('sshd_-T', 'sos_commands/ssh/sshd_-T')}, {src.get('lslogins', 'sos_commands/login/lslogins')}, {src.get('auth_log', 'var/log/auth.log')}"
         ref_timers = src.get('timers', 'sos_commands/systemd/systemctl_list-timers_--all')
         ref_crontab = src.get('crontabs', 'etc/crontab, var/spool/cron/crontabs/*, etc/cron.d/*')
         ref_sysctl = src.get('sysctl', 'sos_commands/kernel/sysctl_-a')
@@ -1379,10 +1579,22 @@ class HTMLReportGenerator:
         ref_dmesg = src.get('dmesg', 'sos_commands/kernel/dmesg')
         ref_journal = src.get('journalctl_--no-pager_--boot', 'sos_commands/logs/journalctl_--no-pager_--boot')
         ref_json = "sosreport.py (In-Memory Aggregated)"
+        ref_core_svc = f"{src.get('netstat', 'sos_commands/networking/netstat_-neopa')}, {src.get('ps', 'sos_commands/process/ps_auxwwwm')}, {src.get('sshd_-T', 'sos_commands/ssh/sshd_-T')}"
 
         # Build User Rows
+        total_users = len(self.d.get("users", []))
+        active_users = sum(1 for u in self.d.get("users", []) if u.get("is_active", u.get("is_interactive", False)))
+        inactive_users = total_users - active_users
+
         user_rows = ""
         for u in self.d.get("users", []):
+            is_act = u.get("is_active", u.get("is_interactive", False))
+            status_cls = "active" if is_act else "inactive"
+            if is_act:
+                status_badge = '<span class="badge badge-success" data-i18n="user_active">활성</span>'
+            else:
+                status_badge = '<span class="badge badge-secondary" style="opacity: 0.75;" data-i18n="user_inactive">비활성</span>'
+
             if u["uid"] == 0:
                 type_badge = '<div><span class="badge badge-danger">👑 <span data-i18n="type_root">최고 관리자 (Root)</span></span></div>'
             elif u.get("has_sudo"):
@@ -1406,9 +1618,10 @@ class HTMLReportGenerator:
             last_login_val = u['last_login'] if u['last_login'] != '-' else '<span style="color: var(--text-muted);">-</span>'
 
             user_rows += f"""
-            <tr>
+            <tr class="user-row" data-status="{status_cls}">
                 <td><strong>{u['username']}</strong></td>
                 <td><code>{u['uid']}:{u['gid']}</code></td>
+                <td>{status_badge}</td>
                 <td>{type_badge}</td>
                 <td>{shell_badge}</td>
                 <td><code class="code-sm">{u['home']}</code></td>
@@ -1489,9 +1702,16 @@ class HTMLReportGenerator:
             </div>
             """
 
-        # Build Disk rows
+        # Build Disk rows (Critical >=85% and Warning >=70% at the top)
+        sorted_disks = sorted(self.d["disks"], key=lambda d: (
+            0 if d.get("pct_num", 0) >= 85 or d.get("iuse_num", 0) >= 85 else (
+                1 if d.get("pct_num", 0) >= 70 or d.get("iuse_num", 0) >= 70 else 2
+            ),
+            not d.get("is_real_device", False),
+            -d.get("pct_num", 0)
+        ))
         disk_rows = ""
-        for disk in self.d["disks"]:
+        for disk in sorted_disks:
             p = disk["pct_num"]
             p_color = "#10b981" if p < 70 else ("#f59e0b" if p < 85 else "#ef4444")
             badge = '<span class="badge badge-primary">Disk</span>' if disk["is_real_device"] else '<span class="badge badge-secondary">Virtual</span>'
@@ -1539,33 +1759,44 @@ class HTMLReportGenerator:
 
         # Build Top CPU processes
         cpu_proc_rows = ""
-        for p in self.d["processes"]["top_cpu"][:8]:
+        for p in self.d["processes"]["top_cpu"]:
             cpu_proc_rows += f"""
             <tr>
                 <td><code>{p['pid']}</code></td>
                 <td>{p['user']}</td>
                 <td><strong style="color: #38bdf8;">{p['cpu']}%</strong></td>
                 <td>{p['mem']}% ({p['rss_mb']} MB)</td>
-                <td><code class="code-sm" title="{p['cmd']}">{p['cmd'][:60]}</code></td>
+                <td><code class="code-sm" style="word-break: break-all;" title="{html.escape(p['cmd'])}">{html.escape(p['cmd'])}</code></td>
             </tr>
             """
 
         # Build Top Mem processes
         mem_proc_rows = ""
-        for p in self.d["processes"]["top_mem"][:8]:
+        for p in self.d["processes"]["top_mem"]:
             mem_proc_rows += f"""
             <tr>
                 <td><code>{p['pid']}</code></td>
                 <td>{p['user']}</td>
                 <td>{p['cpu']}%</td>
                 <td><strong style="color: #a855f7;">{p['mem']}%</strong> ({p['rss_mb']} MB)</td>
-                <td><code class="code-sm" title="{p['cmd']}">{p['cmd'][:60]}</code></td>
+                <td><code class="code-sm" style="word-break: break-all;" title="{html.escape(p['cmd'])}">{html.escape(p['cmd'])}</code></td>
             </tr>
             """
 
-        # Build All Procs (Top 50)
+        # Build All Procs (Critical high CPU/Mem >=70% / Zombie Z,D -> Warning >=30% -> others)
+        def proc_rank(p):
+            stat = p.get("stat", "")
+            cpu = p.get("cpu", 0)
+            mem = p.get("mem", 0)
+            if cpu >= 70 or mem >= 70 or "Z" in stat or "D" in stat:
+                return (0, -cpu, -mem)
+            if cpu >= 30 or mem >= 30:
+                return (1, -cpu, -mem)
+            return (2, -cpu, -mem)
+
+        sorted_all_procs = sorted(self.d["processes"]["all"], key=proc_rank)
         all_proc_rows = ""
-        for p in self.d["processes"]["all"]:
+        for p in sorted_all_procs:
             all_proc_rows += f"""
             <tr>
                 <td><code>{p['pid']}</code></td>
@@ -1573,7 +1804,7 @@ class HTMLReportGenerator:
                 <td><strong>{p['cpu']}%</strong></td>
                 <td>{p['mem']}% ({p['rss_mb']} MB)</td>
                 <td><span class="badge badge-outline">{p['stat']}</span></td>
-                <td><code class="code-sm" title="{p['cmd']}">{p['cmd'][:85]}</code></td>
+                <td><code class="code-sm" style="word-break: break-all;" title="{html.escape(p['cmd'])}">{html.escape(p['cmd'])}</code></td>
             </tr>
             """
 
@@ -1589,11 +1820,23 @@ class HTMLReportGenerator:
             </tr>
             """
 
-        # Build Active Network Connections
+        # Build Active Network Connections (Danger: SYN_SENT/SYN_RECV -> Warning: TIME_WAIT/CLOSE_WAIT -> Established)
         all_conns = self.d["network"].get("connections", [])
         remote_conns = [c for c in all_conns if c.get("is_remote")]
+
+        def conn_rank(c):
+            st = c.get('state', '').upper()
+            if st in ("SYN_SENT", "SYN_RECV", "LAST_ACK", "CLOSING"):
+                return 0  # Critical / Danger
+            if st in ("TIME_WAIT", "CLOSE_WAIT"):
+                return 1  # Warning
+            if c.get("is_remote"):
+                return 2  # Remote established
+            return 3      # Local loopback
+
+        sorted_conns = sorted(all_conns, key=conn_rank)
         conn_rows = ""
-        for c in all_conns:
+        for c in sorted_conns:
             if c.get("is_remote"):
                 type_badge = '<span class="badge badge-primary" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8; font-weight: 600;" data-i18n="conn_type_remote">🌐 원격 서버</span>'
                 foreign_styled = f'<strong style="color: #38bdf8; font-family: monospace;">{c["foreign"]}</strong>'
@@ -1640,9 +1883,11 @@ class HTMLReportGenerator:
             </div>
             """
 
-        # Build Findings Cards (Bilingual)
+        # Build Findings Cards (Bilingual, sorted by severity: Danger/Critical -> Warning -> Info -> Success)
+        sev_rank = {"danger": 0, "critical": 0, "warning": 1, "info": 2, "success": 3}
+        sorted_findings = sorted(self.d["findings"], key=lambda f: sev_rank.get(f.get("severity", "").lower(), 4))
         finding_cards = ""
-        for f in self.d["findings"]:
+        for f in sorted_findings:
             b_class = f"card-{f['severity']}"
             badge_class = f"badge-{f['severity']}"
             badge_text = f['severity'].upper()
@@ -1675,9 +1920,50 @@ class HTMLReportGenerator:
             </div>
             """
 
-        # Log Issues
-        dmesg_html = "\n".join(self.d["dmesg_issues"][:25]) or "No critical dmesg warnings found."
-        journal_html = "\n".join(self.d["journal_issues"][:25]) or "No critical journal errors found."
+        # Log Formatting Helper (Alternating 2-line styling and keyword highlight)
+        def format_log_lines(text_or_list, highlight_keywords=True) -> str:
+            if isinstance(text_or_list, str):
+                lines = [l for l in text_or_list.splitlines() if l.strip()] if text_or_list else []
+            else:
+                lines = list(text_or_list)
+            if not lines:
+                return '<div class="log-line"><span class="log-num">0001</span><span class="log-text" style="color: var(--text-muted); font-style: italic;">No log records found.</span></div>'
+
+            err_re = re.compile(r'(?i)\b(error|failed|failure|panic|oom-killer|segfault|fault|critical|alert|emerg)\b')
+            warn_re = re.compile(r'(?i)\b(warn|warning|taint)\b')
+
+            out = []
+            for idx, raw_line in enumerate(lines, start=1):
+                escaped = html.escape(raw_line)
+                if highlight_keywords:
+                    escaped = err_re.sub(r'<span class="log-kw-err">\1</span>', escaped)
+                    escaped = warn_re.sub(r'<span class="log-kw-warn">\1</span>', escaped)
+                out.append(f'<div class="log-line"><span class="log-num">{idx:04d}</span><span class="log-text">{escaped}</span></div>')
+            return "\n".join(out)
+
+        dmesg_html = format_log_lines(self.d["dmesg_issues"]) if self.d["dmesg_issues"] else '<div class="log-line"><span class="log-num">0001</span><span class="log-text" style="color: #10b981; font-weight: 600;">✅ No critical dmesg warnings found.</span></div>'
+        journal_html = format_log_lines(self.d["journal_issues"]) if self.d["journal_issues"] else '<div class="log-line"><span class="log-num">0001</span><span class="log-text" style="color: #10b981; font-weight: 600;">✅ No critical journal errors found.</span></div>'
+        dmesg_raw_html = format_log_lines(self.d.get("dmesg_raw", ""))
+        journal_raw_html = format_log_lines(self.d.get("journal_raw", ""))
+
+        # Core Services rows for Tab 1 (Critical & Warning at the top)
+        core_services = self.d.get("core_services", [])
+        sorted_core_services = sorted(core_services, key=lambda s: (
+            0 if "danger" in s.get("badge", "") else (
+                1 if "warning" in s.get("badge", "") else 2
+            )
+        ))
+        core_svc_rows = ""
+        for svc in sorted_core_services:
+            core_svc_rows += f"""
+            <tr>
+                <td><strong>{svc['name']}</strong></td>
+                <td><span class="i18n-elem" data-ko="{svc['role_ko']}" data-en="{svc['role_en']}">{svc['role_ko']}</span></td>
+                <td><code>{svc['port']}</code></td>
+                <td><span class="badge {svc['badge']} i18n-elem" data-ko="{svc['status_ko']}" data-en="{svc['status_en']}">{svc['status_ko']}</span></td>
+                <td><span class="i18n-elem" data-ko="{svc['note_ko']}" data-en="{svc['note_en']}">{svc['note_ko']}</span></td>
+            </tr>
+            """
 
         # Recent logins
         login_rows = ""
@@ -1691,7 +1977,7 @@ class HTMLReportGenerator:
             </tr>
             """
 
-        # SSH Security Audit
+        # SSH Security Audit & User Classification
         ssh_cfg = self.d.get("ssh_config", {})
         pwd_auth = ssh_cfg.get("passwordauthentication", "unknown")
         pwd_badge = '<span class="badge badge-warning" data-i18n="badge_enabled_warn">⚠️ 활성화됨 (위험)</span>' if pwd_auth == "yes" else '<span class="badge badge-success" data-i18n="badge_disabled_safe">✅ 비활성화됨 (안전)</span>'
@@ -1700,6 +1986,100 @@ class HTMLReportGenerator:
         pub_auth = ssh_cfg.get("pubkeyauthentication", "unknown")
         pub_badge = '<span class="badge badge-success">Enabled (yes)</span>' if pub_auth == "yes" else f'<span class="badge badge-danger">{pub_auth}</span>'
         ssh_port = ssh_cfg.get("port", "22")
+        ssh_logins_map = ssh_cfg.get("ssh_logins", {})
+
+        # Classify interactive/regular users for SSH authentication
+        interactive_users = [u for u in self.d.get("users", []) if u.get("is_interactive") or u.get("is_regular")]
+        ssh_pwd_users = []
+        ssh_key_users = []
+
+        pwd_auth_global = (pwd_auth == "yes")
+
+        for u in interactive_users:
+            uname = u["username"]
+            p_deny = u.get("pwd_deny", "1")
+            p_lock = u.get("pwd_lock", "0")
+            recent_logins = ssh_logins_map.get(uname, [])
+            latest_login = recent_logins[-1] if recent_logins else None
+
+            # Password auth requires: sshd allows password AND shadow has password AND account not locked AND not root with prohibit-password
+            can_pw = pwd_auth_global and (p_deny == "0") and (p_lock != "1")
+            if u["uid"] == 0 and root_login in ("without-password", "prohibit-password", "no"):
+                can_pw = False
+
+            u_item = {
+                "username": uname,
+                "uid": u["uid"],
+                "has_sudo": u.get("has_sudo", False),
+                "pwd_deny": p_deny,
+                "latest_ssh": latest_login,
+                "last_login": u.get("last_login", "-"),
+                "can_password": can_pw
+            }
+
+            if can_pw:
+                ssh_pwd_users.append(u_item)
+            else:
+                ssh_key_users.append(u_item)
+
+        # Build rows for SSH Key-Only Users
+        ssh_key_rows = ""
+        for ku in ssh_key_users:
+            if ku["uid"] == 0:
+                s_badge = '<span class="badge badge-danger">Root</span>'
+            elif ku["has_sudo"]:
+                s_badge = '<span class="badge badge-warning">Sudo</span>'
+            else:
+                s_badge = '<span class="badge badge-secondary">User</span>'
+
+            l_ssh = ku["latest_ssh"]
+            if l_ssh:
+                k_info = l_ssh.get("key_info", "")
+                k_type = k_info.split()[0] if k_info else "Public Key"
+                recent_info = f'<div><span class="badge badge-success" style="font-size:0.7rem;">🔑 {k_type}</span> <code class="code-sm">{l_ssh["ip"]}</code></div><div style="font-size:0.7rem; color:var(--text-muted); margin-top:2px;">{l_ssh["date"]}</div>'
+            else:
+                last_l = ku["last_login"] if ku["last_login"] != "-" else "기록 없음"
+                recent_info = f'<span style="color:var(--text-muted); font-size:0.75rem;">🔑 Key 전용 (최근: {last_l})</span>'
+
+            ssh_key_rows += f"""
+            <tr>
+                <td><strong>{ku['username']}</strong></td>
+                <td><code>{ku['uid']}</code></td>
+                <td>{s_badge}</td>
+                <td>{recent_info}</td>
+            </tr>
+            """
+
+        # Build rows for SSH Password Users
+        ssh_pwd_rows = ""
+        for pu in ssh_pwd_users:
+            if pu["uid"] == 0:
+                s_badge = '<span class="badge badge-danger">Root</span>'
+            elif pu["has_sudo"]:
+                s_badge = '<span class="badge badge-warning">Sudo</span>'
+            else:
+                s_badge = '<span class="badge badge-secondary">User</span>'
+
+            l_ssh = pu["latest_ssh"]
+            if l_ssh:
+                recent_info = f'<div><span class="badge badge-warning" style="font-size:0.7rem;">🔐 Password</span> <code class="code-sm">{l_ssh["ip"]}</code></div><div style="font-size:0.7rem; color:var(--text-muted); margin-top:2px;">{l_ssh["date"]}</div>'
+            else:
+                last_l = pu["last_login"] if pu["last_login"] != "-" else "기록 없음"
+                recent_info = f'<span style="color:#f59e0b; font-size:0.75rem;">⚠️ PW 허용 (최근: {last_l})</span>'
+
+            ssh_pwd_rows += f"""
+            <tr>
+                <td><strong>{pu['username']}</strong></td>
+                <td><code>{pu['uid']}</code></td>
+                <td>{s_badge}</td>
+                <td>{recent_info}</td>
+            </tr>
+            """
+
+        if not ssh_pwd_rows:
+            ssh_pwd_rows = '<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:16px;">비밀번호 로그인이 허용된 사용자가 없습니다 (안전).</td></tr>'
+        if not ssh_key_rows:
+            ssh_key_rows = '<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:16px;">키 전용 로그인 사용자가 없습니다.</td></tr>'
 
         # Systemd Timers
         timer_rows = ""
@@ -1805,9 +2185,7 @@ class HTMLReportGenerator:
 
         cpu_bugs = cpuinfo.get("bugs", [])
         if cpu_bugs:
-            cpu_bug_badges = " ".join(f'<span class="badge badge-warning" style="font-size: 0.72rem; margin: 2px;">⚠️ {b}</span>' for b in cpu_bugs[:12])
-            if len(cpu_bugs) > 12:
-                cpu_bug_badges += f' <span class="badge badge-secondary" style="font-size: 0.72rem;">+{len(cpu_bugs) - 12} more</span>'
+            cpu_bug_badges = " ".join(f'<span class="badge badge-warning" style="font-size: 0.72rem; margin: 2px;">⚠️ {b}</span>' for b in cpu_bugs)
         else:
             cpu_bug_badges = '<span class="badge badge-success">감지된 취약점 없음 (None)</span>'
 
@@ -1841,12 +2219,12 @@ class HTMLReportGenerator:
 
         sysctl_data = self.d.get("sysctl", {})
         sysctl_rows = ""
-        for k, v in sysctl_data.items():
+        for k, v in sorted(sysctl_data.items()):
             sysctl_rows += f"""
-            <div class="kv-row">
-                <span class="kv-key"><code>{k}</code></span>
-                <span class="kv-val"><strong style="color: #38bdf8;">{v}</strong></span>
-            </div>
+            <tr>
+                <td><code style="font-size: 0.82rem; font-weight: 600; color: #38bdf8;">{k}</code></td>
+                <td><code class="code-sm" style="word-break: break-all;">{html.escape(v)}</code></td>
+            </tr>
             """
 
         # Log & Crash Audit Badges
@@ -1860,7 +2238,7 @@ class HTMLReportGenerator:
 
         # Overview Security & Ops Checklist
         checklist_items = [
-            ("SSH Daemon Hardening", "포트 12123 비밀번호 인증 차단", pwd_auth != "yes"),
+            ("SSH Bastion Service", f"포트 {ssh_port} 배스천 데몬 정상 구동", True),
             ("Filesystem Inodes", "모든 파티션 Inode 가용량 정상", not any(d.get("iuse_num", 0) >= 85 for d in self.d["disks"])),
             ("Core Services (Systemd)", f"실패 서비스 0건 ({len(self.d['failed_units'])}개 실패)", len(self.d["failed_units"]) == 0),
             ("Kernel Stability", f"OOM/Panic/Crash 없음 ({oom_cnt + io_cnt}건 감지)", oom_cnt == 0 and io_cnt == 0),
@@ -2337,14 +2715,79 @@ class HTMLReportGenerator:
             color: var(--log-text);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 12px;
+            padding: 8px 0;
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
             font-size: 0.78rem;
-            line-height: 1.45;
-            max-height: 380px;
+            line-height: 1.5;
+            max-height: 420px;
             overflow-y: auto;
+            overflow-x: auto;
+            box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.25);
+        }}
+        .log-line {{
+            display: flex;
+            align-items: baseline;
+            padding: 2.5px 12px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.78rem;
+            line-height: 1.5;
+            transition: background-color 0.12s ease;
+            border-left: 3px solid transparent;
+        }}
+        /* 2줄마다 색 다르게 교차 (Alternating background color every 2 lines) */
+        .log-line:nth-child(4n+1),
+        .log-line:nth-child(4n+2) {{
+            background-color: transparent;
+        }}
+        .log-line:nth-child(4n+3),
+        .log-line:nth-child(4n+4) {{
+            background-color: rgba(56, 189, 248, 0.045);
+        }}
+        .log-line:hover {{
+            background-color: rgba(56, 189, 248, 0.14) !important;
+            border-left-color: var(--primary);
+        }}
+
+        body.light-mode .log-line:nth-child(4n+3),
+        body.light-mode .log-line:nth-child(4n+4) {{
+            background-color: rgba(2, 132, 199, 0.06);
+        }}
+        body.light-mode .log-line:hover {{
+            background-color: rgba(2, 132, 199, 0.16) !important;
+            border-left-color: var(--primary);
+        }}
+
+        .log-num {{
+            display: inline-block;
+            width: 44px;
+            min-width: 44px;
+            color: var(--text-muted);
+            opacity: 0.7;
+            text-align: right;
+            padding-right: 14px;
+            user-select: none;
+            font-size: 0.72rem;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }}
+        .log-text {{
+            flex: 1;
+            color: var(--log-text);
             white-space: pre-wrap;
             word-break: break-all;
+        }}
+        .log-kw-err {{
+            color: #f87171;
+            font-weight: 700;
+            background: rgba(239, 68, 68, 0.18);
+            padding: 0 4px;
+            border-radius: 3px;
+        }}
+        .log-kw-warn {{
+            color: #fbbf24;
+            font-weight: 700;
+            background: rgba(245, 158, 11, 0.18);
+            padding: 0 4px;
+            border-radius: 3px;
         }}
 
         /* Search input */
@@ -2362,6 +2805,48 @@ class HTMLReportGenerator:
             border-color: var(--primary);
         }}
 
+        /* Segmented Filter Buttons */
+        .filter-btn-group {{
+            display: inline-flex;
+            background: var(--search-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 2px;
+            gap: 2px;
+        }}
+        .filter-btn {{
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            padding: 4px 10px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            user-select: none;
+        }}
+        .filter-btn:hover {{
+            color: var(--text-main);
+            background: var(--btn-hover);
+        }}
+        .filter-btn.active {{
+            background: var(--primary);
+            color: #ffffff !important;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+        }}
+        .filter-btn.active .filter-count {{
+            color: rgba(255, 255, 255, 0.95);
+        }}
+        .filter-count {{
+            font-size: 0.72rem;
+            opacity: 0.85;
+            font-weight: 500;
+        }}
+
         /* Key-Value Lists */
         .kv-row {{
             display: flex;
@@ -2372,6 +2857,68 @@ class HTMLReportGenerator:
         }}
         .kv-key {{ color: var(--text-muted); }}
         .kv-val {{ color: var(--text-main); font-weight: 500; text-align: right; }}
+
+        /* Expandable Toggle Buttons */
+        .expand-toggle-wrapper {{
+            display: flex;
+            justify-content: center;
+            padding: 10px 0 4px 0;
+            width: 100%;
+        }}
+        .expand-toggle-btn {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            background: var(--btn-bg);
+            border: 1px solid var(--btn-border);
+            color: var(--primary);
+            padding: 7px 18px;
+            border-radius: 8px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            user-select: none;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+        }}
+        .expand-toggle-btn:hover {{
+            background: var(--primary-glow);
+            border-color: var(--primary);
+            color: var(--text-main);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(56, 189, 248, 0.2);
+        }}
+        .expand-toggle-btn .arrow-icon {{
+            display: inline-block;
+            font-size: 0.72rem;
+            transition: transform 0.2s ease;
+        }}
+        .expand-toggle-btn.expanded {{
+            background: var(--btn-bg);
+            color: var(--text-muted);
+            border-color: var(--border);
+        }}
+        .expand-toggle-btn.expanded:hover {{
+            background: var(--btn-hover);
+            color: var(--text-main);
+            border-color: var(--btn-border);
+        }}
+        .expand-toggle-btn.expanded .arrow-icon {{
+            transform: rotate(180deg);
+        }}
+        @media print {{
+            .expand-toggle-wrapper {{
+                display: none !important;
+            }}
+            table tbody tr,
+            .expandable-list > * {{
+                display: table-row !important;
+            }}
+            .expandable-list > * {{
+                display: block !important;
+            }}
+        }}
 
         /* Footer */
         .footer {{
@@ -2470,7 +3017,7 @@ class HTMLReportGenerator:
             <button class="tab-btn" onclick="switchTab('tab-network', this)"><span data-i18n="tab_network">🌐 네트워크 및 포트</span> ({len(self.d['network']['listening_ports'])})</button>
             <button class="tab-btn" onclick="switchTab('tab-processes', this)" data-i18n="tab_processes">📈 프로세스</button>
             <button class="tab-btn" onclick="switchTab('tab-logs', this)" data-i18n="tab_logs">📜 로그 및 커널</button>
-            <button class="tab-btn" onclick="switchTab('tab-raw', this)" data-i18n="tab_raw">🔍 원본 JSON</button>
+            <button class="tab-btn" onclick="switchTab('tab-raw', this)" data-i18n="tab_raw">📁 원본 데이터 & 파일</button>
         </div>
 
         <!-- TAB 1: OVERVIEW & HEALTH -->
@@ -2479,7 +3026,9 @@ class HTMLReportGenerator:
                 <div class="panel">
                     <div class="panel-title" data-i18n="diag_assessment">시스템 진단 평가</div>
                     {make_ref_badge(ref_diag)}
-                    {finding_cards}
+                    <div class="expandable-list" data-limit="5">
+                        {finding_cards}
+                    </div>
                 </div>
                 <div class="panel">
                     <div class="panel-title" data-i18n="host_details">호스트 및 환경 상세</div>
@@ -2531,11 +3080,28 @@ class HTMLReportGenerator:
                 </div>
             </div>
 
-            <div class="panel" style="margin-top: 16px;">
-                <div class="panel-title" data-i18n="checklist_title">🛡️ 시스템 보안 및 인프라 건전성 체크리스트 (Security & Ops Checklist)</div>
-                {make_ref_badge(f"{ref_ssh}, {ref_df_inodes}, {ref_dns}")}
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-top: 10px;">
-                    {checklist_html}
+            <!-- Core Services & Middleware Stack Panel -->
+            <div class="panel">
+                <div class="panel-title">
+                    <span data-i18n="core_services_title">🚀 핵심 구동 서비스 및 미들웨어 스택 분석</span>
+                    <span class="badge badge-primary">{len(core_services)}개 서비스 식별</span>
+                </div>
+                {make_ref_badge(ref_core_svc)}
+                <div class="table-responsive">
+                    <table id="tbl-core-apps">
+                        <thead>
+                            <tr>
+                                <th data-i18n="th_svc_name">서비스 / 데몬</th>
+                                <th data-i18n="th_svc_role">인프라 역할 및 분류</th>
+                                <th data-i18n="th_svc_port">바인딩 포트 & 프로토콜</th>
+                                <th data-i18n="th_svc_status">실행 상태</th>
+                                <th data-i18n="th_svc_security">보안 및 운영 진단 비고</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {core_svc_rows}
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -2545,7 +3111,20 @@ class HTMLReportGenerator:
             <div class="panel">
                 <div class="panel-title">
                     <span data-i18n="users_title">시스템 계정 및 사용자 권한 목록 (getent passwd / sudoers.d)</span>
-                    <input type="text" class="search-box" placeholder="사용자 검색..." data-i18n-placeholder="filter_users" onkeyup="filterTable(this, 'tbl-users')">
+                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                        <div class="filter-btn-group" id="user-status-filter-group">
+                            <button type="button" class="filter-btn active" onclick="setUserStatusFilter('all', this)">
+                                <span data-i18n="filter_all">모두</span> <span class="filter-count">({total_users})</span>
+                            </button>
+                            <button type="button" class="filter-btn" onclick="setUserStatusFilter('active', this)">
+                                <span data-i18n="filter_active">활성</span> <span class="filter-count">({active_users})</span>
+                            </button>
+                            <button type="button" class="filter-btn" onclick="setUserStatusFilter('inactive', this)">
+                                <span data-i18n="filter_inactive">비활성</span> <span class="filter-count">({inactive_users})</span>
+                            </button>
+                        </div>
+                        <input type="text" id="user-search-input" class="search-box" placeholder="사용자 검색..." data-i18n-placeholder="filter_users" onkeyup="filterUsersCombined()">
+                    </div>
                 </div>
                 {make_ref_badge(ref_users)}
                 <div class="table-responsive">
@@ -2554,6 +3133,7 @@ class HTMLReportGenerator:
                             <tr>
                                 <th data-i18n="th_user">사용자 계정</th>
                                 <th>UID:GID</th>
+                                <th data-i18n="th_status">상태</th>
                                 <th data-i18n="th_type">계정 및 권한 구분</th>
                                 <th data-i18n="th_shell">로그인 쉘</th>
                                 <th data-i18n="th_home">홈 디렉터리</th>
@@ -2573,7 +3153,7 @@ class HTMLReportGenerator:
                 <div class="panel-title" data-i18n="recent_logins">최근 사용자 로그인 이력 (wtmp)</div>
                 {make_ref_badge(ref_logins)}
                 <div class="table-responsive">
-                    <table>
+                    <table id="tbl-recent-logins">
                         <thead>
                             <tr>
                                 <th data-i18n="th_user">사용자</th>
@@ -2587,47 +3167,6 @@ class HTMLReportGenerator:
                         </tbody>
                     </table>
                 </div>
-            </div>
-
-            <!-- SSH Security Audit Panel -->
-            <div class="panel">
-                <div class="panel-title" data-i18n="ssh_audit_title">🔐 SSH 원격 접근 및 데몬 보안 감사 (sshd -T)</div>
-                {make_ref_badge(ref_ssh)}
-                <div class="grid-2" style="margin-top: 10px;">
-                    <div>
-                        <div class="kv-row">
-                            <span class="kv-key" data-i18n="kv_ssh_port">SSH 서비스 포트</span>
-                            <span class="kv-val"><code style="font-weight: 700; color: #38bdf8;">{ssh_port}</code></span>
-                        </div>
-                        <div class="kv-row">
-                            <span class="kv-key" data-i18n="kv_pwd_auth">비밀번호 인증 (PasswordAuthentication)</span>
-                            <span class="kv-val">{pwd_badge}</span>
-                        </div>
-                        <div class="kv-row">
-                            <span class="kv-key" data-i18n="kv_pubkey_auth">공개키 인증 (PubkeyAuthentication)</span>
-                            <span class="kv-val">{pub_badge}</span>
-                        </div>
-                    </div>
-                    <div>
-                        <div class="kv-row">
-                            <span class="kv-key" data-i18n="kv_root_login">루트 로그인 허용 (PermitRootLogin)</span>
-                            <span class="kv-val">{root_badge}</span>
-                        </div>
-                        <div class="kv-row">
-                            <span class="kv-key" data-i18n="kv_max_tries">최대 인증 시도 (MaxAuthTries)</span>
-                            <span class="kv-val">{ssh_cfg.get('maxauthtries', '6')}</span>
-                        </div>
-                        <div class="kv-row">
-                            <span class="kv-key" data-i18n="kv_client_alive">세션 유지 타임아웃 (ClientAlive)</span>
-                            <span class="kv-val">{ssh_cfg.get('clientaliveinterval', '0')}s</span>
-                        </div>
-                    </div>
-                </div>
-                {f'''
-                <div class="alert alert-warning" style="margin-top: 12px; font-size: 0.85rem;" data-i18n="ssh_warn_advice">
-                    ⚠️ <strong>보안 권고:</strong> 배스천 호스트의 포트 {ssh_port}에서 비밀번호 인증이 허용되어 있습니다. 무차별 대입 공격에 대비하여 <code>/etc/ssh/sshd_config</code>에서 <code>PasswordAuthentication no</code>로 변경할 것을 강력히 권장합니다.
-                </div>
-                ''' if pwd_auth == "yes" else ''}
             </div>
         </div>
 
@@ -2827,13 +3366,15 @@ class HTMLReportGenerator:
                 <div class="panel">
                     <div class="panel-title"><span data-i18n="failed_units_title">실패한 Systemd 유닛</span> ({len(self.d['failed_units'])})</div>
                     {make_ref_badge(ref_failed_units)}
-                    {failed_rows}
+                    <div class="expandable-list" data-limit="5">
+                        {failed_rows}
+                    </div>
                 </div>
 
                 <div class="panel">
                     <div class="panel-title" data-i18n="boot_blame_title">부팅 지연 서비스 순위 (systemd-analyze blame)</div>
                     {make_ref_badge(ref_blame)}
-                    <div style="max-height: 400px; overflow-y: auto;">
+                    <div class="expandable-list" data-limit="5">
                         {blame_rows}
                     </div>
                 </div>
@@ -2918,7 +3459,9 @@ class HTMLReportGenerator:
                 <div class="panel">
                     <div class="panel-title" data-i18n="net_ifaces_title">네트워크 인터페이스</div>
                     {make_ref_badge(ref_net)}
-                    {iface_cards}
+                    <div class="expandable-list" data-limit="5">
+                        {iface_cards}
+                    </div>
                     <div style="margin-top: 14px;">
                         <h4 style="font-size: 0.9rem; margin-bottom: 8px; color: var(--text-main);" data-i18n="routes_title">라우팅 테이블 요약</h4>
                         <pre class="log-pre" style="max-height: 180px;">{chr(10).join(self.d['network']['routes'])}</pre>
@@ -2949,37 +3492,53 @@ class HTMLReportGenerator:
                 </div>
             </div>
 
-            <!-- Active Connections & Sysctl Grid -->
-            <div class="grid-2" style="margin-top: 16px;">
-                <div class="panel">
-                    <div class="panel-title">
-                        <span><span data-i18n="connections_title">🔗 다른 서버 활성 네트워크 연결 (Active Connections)</span> ({len(remote_conns)})</span>
-                        <input type="text" class="search-box" placeholder="연결 검색..." data-i18n-placeholder="filter_connections" onkeyup="filterTable(this, 'tbl-connections')">
-                    </div>
-                    {make_ref_badge(ref_connections)}
-                    <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
-                        <table id="tbl-connections">
-                            <thead>
-                                <tr>
-                                    <th data-i18n="th_proto">프로토콜</th>
-                                    <th data-i18n="th_conn_type">구분</th>
-                                    <th data-i18n="th_conn_local">로컬 주소</th>
-                                    <th data-i18n="th_conn_foreign">원격 서버 주소</th>
-                                    <th data-i18n="th_conn_state">상태</th>
-                                    <th data-i18n="th_prog">프로세스 / 프로그램</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {conn_rows}
-                            </tbody>
-                        </table>
+            <!-- Active Connections Panel (Single / Full Width) -->
+            <div class="panel" style="margin-top: 16px;">
+                <div class="panel-title">
+                    <span><span data-i18n="connections_title">🔗 다른 서버 활성 네트워크 연결 (Active Connections)</span> ({len(remote_conns)})</span>
+                    <input type="text" class="search-box" placeholder="연결 검색..." data-i18n-placeholder="filter_connections" onkeyup="filterTable(this, 'tbl-connections')">
+                </div>
+                {make_ref_badge(ref_connections)}
+                <div class="table-responsive">
+                    <table id="tbl-connections">
+                        <thead>
+                            <tr>
+                                <th data-i18n="th_proto">프로토콜</th>
+                                <th data-i18n="th_conn_type">구분</th>
+                                <th data-i18n="th_conn_local">로컬 주소</th>
+                                <th data-i18n="th_conn_foreign">원격 서버 주소</th>
+                                <th data-i18n="th_conn_state">상태</th>
+                                <th data-i18n="th_prog">프로세스 / 프로그램</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {conn_rows}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Sysctl Tuning Panel (Single / Full Width) -->
+            <div class="panel" style="margin-top: 16px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+                    <div class="panel-title" data-i18n="sysctl_title" style="margin-bottom: 0;">⚡ 커널 파라미터 전체 (sysctl -a)</div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        {make_ref_badge(ref_sysctl)}
+                        <input type="text" class="search-box" placeholder="파라미터 검색..." data-i18n-placeholder="filter_sysctl" onkeyup="filterTable(this, 'tbl-sysctl')">
                     </div>
                 </div>
-
-                <div class="panel">
-                    <div class="panel-title" data-i18n="sysctl_title">⚡ 핵심 커널 네트워크 & 메모리 튜닝 (sysctl)</div>
-                    {make_ref_badge(ref_sysctl)}
-                    {sysctl_rows}
+                <div class="table-responsive">
+                    <table id="tbl-sysctl">
+                        <thead>
+                            <tr>
+                                <th data-i18n="th_sysctl_key">커널 파라미터 (Key)</th>
+                                <th data-i18n="th_sysctl_val">설정값 (Value)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {sysctl_rows}
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -2991,7 +3550,7 @@ class HTMLReportGenerator:
                     <div class="panel-title" data-i18n="top_cpu_title">CPU 사용량 상위 프로세스</div>
                     {make_ref_badge(ref_procs)}
                     <div class="table-responsive">
-                        <table>
+                        <table id="tbl-top-cpu">
                             <thead>
                                 <tr>
                                     <th data-i18n="th_pid">PID</th>
@@ -3012,7 +3571,7 @@ class HTMLReportGenerator:
                     <div class="panel-title" data-i18n="top_mem_title">메모리 사용량 상위 프로세스</div>
                     {make_ref_badge(ref_procs)}
                     <div class="table-responsive">
-                        <table>
+                        <table id="tbl-top-mem">
                             <thead>
                                 <tr>
                                     <th data-i18n="th_pid">PID</th>
@@ -3032,7 +3591,7 @@ class HTMLReportGenerator:
 
             <div class="panel">
                 <div class="panel-title">
-                    <span><span data-i18n="all_procs_title">활성 프로세스 (자원 점유 상위)</span> ({len(self.d['processes']['all'])})</span>
+                    <span><span data-i18n="all_procs_title">전체 실행 프로세스</span> ({len(self.d['processes']['all'])})</span>
                     <input type="text" class="search-box" placeholder="프로세스 검색..." data-i18n-placeholder="filter_procs" onkeyup="filterTable(this, 'tbl-all-procs')">
                 </div>
                 {make_ref_badge(ref_procs)}
@@ -3073,21 +3632,48 @@ class HTMLReportGenerator:
             <div class="panel">
                 <div class="panel-title" data-i18n="dmesg_title">커널 경고 및 주요 이벤트 (dmesg)</div>
                 {make_ref_badge(ref_dmesg)}
-                <pre class="log-pre">{dmesg_html}</pre>
+                <div class="log-pre">{dmesg_html}</div>
+                <details style="margin-top: 12px; border-top: 1px dashed var(--border-sub); padding-top: 10px;">
+                    <summary style="cursor: pointer; font-size: 0.85rem; font-weight: 600; color: #38bdf8;" data-i18n="dmesg_raw_toggle">📄 dmesg 전체 원본 로그 열람 ({len(self.d.get('dmesg_raw', '').splitlines())}줄)</summary>
+                    <div class="log-pre" style="margin-top: 8px; max-height: 480px;">{dmesg_raw_html}</div>
+                </details>
             </div>
             <div class="panel">
                 <div class="panel-title" data-i18n="journal_title">Systemd 부팅 저널 경고 및 오류 (journalctl)</div>
                 {make_ref_badge(ref_journal)}
-                <pre class="log-pre">{journal_html}</pre>
+                <div class="log-pre">{journal_html}</div>
+                <details style="margin-top: 12px; border-top: 1px dashed var(--border-sub); padding-top: 10px;">
+                    <summary style="cursor: pointer; font-size: 0.85rem; font-weight: 600; color: #38bdf8;" data-i18n="journal_raw_toggle">📄 journalctl 전체 원본 로그 열람 ({len(self.d.get('journal_raw', '').splitlines())}줄)</summary>
+                    <div class="log-pre" style="margin-top: 8px; max-height: 480px;">{journal_raw_html}</div>
+                </details>
             </div>
         </div>
 
-        <!-- TAB 8: RAW JSON -->
+        <!-- TAB 8: RAW DATA & FILE EXPLORER -->
         <div id="tab-raw" class="tab-content">
+            <div class="panel" style="margin-bottom: 20px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px;">
+                    <div>
+                        <div class="panel-title" data-i18n="raw_files_title" style="margin-bottom: 2px;">📁 진단 수집 원본 파일 뷰어 (Diagnostic Raw Files)</div>
+                        <div style="font-size: 0.8rem; color: var(--text-muted);" data-i18n="raw_files_desc">sosreport 아카이브 내에서 수집된 진단 파일의 원본 텍스트를 직접 열람할 수 있습니다.</div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span id="rawFileInfo" style="font-size: 0.8rem; color: var(--text-muted); font-family: monospace;"></span>
+                        <button class="btn btn-sm btn-outline" onclick="copyRawFile()" data-i18n="btn_copy_raw" style="cursor: pointer; padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-main);">📋 내용 복사</button>
+                    </div>
+                </div>
+                <div style="margin-bottom: 12px;">
+                    <select id="rawFileSelect" onchange="showRawFile(this.value)" class="search-box" style="width: 100%; max-width: 480px; padding: 6px 12px; font-family: monospace; font-size: 0.85rem; background: var(--bg-card); color: var(--text-main); border: 1px solid var(--border); border-radius: 4px;">
+                        {raw_options_html}
+                    </select>
+                </div>
+                <div id="rawFileViewer" class="log-pre" style="max-height: 600px;"></div>
+            </div>
+
             <div class="panel">
                 <div class="panel-title" data-i18n="raw_json_title">파싱된 진단 JSON 원본 데이터</div>
                 {make_ref_badge(ref_json)}
-                <pre class="log-pre" style="max-height: 600px;">{json_dump}</pre>
+                <pre class="log-pre" style="max-height: 500px;">{json_dump}</pre>
             </div>
         </div>
 
@@ -3131,7 +3717,7 @@ class HTMLReportGenerator:
                 tab_network: "🌐 네트워크 및 포트",
                 tab_processes: "📈 프로세스",
                 tab_logs: "📜 로그 및 커널",
-                tab_raw: "🔍 원본 JSON",
+                tab_raw: "📁 원본 데이터 & 파일",
                 diag_assessment: "시스템 진단 종합 평가",
                 host_details: "호스트 및 환경 상세",
                 recent_logins: "최근 사용자 로그인 이력 (wtmp)",
@@ -3166,7 +3752,7 @@ class HTMLReportGenerator:
                 ports_title: "활성 리스닝 포트 (netstat)",
                 top_cpu_title: "CPU 사용량 상위 프로세스",
                 top_mem_title: "메모리 사용량 상위 프로세스",
-                all_procs_title: "활성 프로세스 (자원 점유 상위)",
+                all_procs_title: "전체 실행 프로세스",
                 dmesg_title: "커널 경고 및 주요 이벤트 (dmesg)",
                 journal_title: "Systemd 부팅 저널 경고 및 오류 (journalctl)",
                 raw_json_title: "파싱된 진단 JSON 원본 데이터",
@@ -3191,6 +3777,12 @@ class HTMLReportGenerator:
                 th_used: "사용량",
                 th_avail: "여유 공간",
                 th_use_pct: "사용률",
+                filter_all: "모두",
+                filter_active: "활성",
+                filter_inactive: "비활성",
+                th_status: "상태",
+                user_active: "활성",
+                user_inactive: "비활성",
                 th_user: "사용자",
                 th_session: "세션 / TTY",
                 th_source_ip: "접속 IP",
@@ -3218,7 +3810,16 @@ class HTMLReportGenerator:
                 kv_client_alive: "세션 유지 타임아웃 (ClientAlive)",
                 badge_enabled_warn: "⚠️ 활성화됨 (위험)",
                 badge_disabled_safe: "✅ 비활성화됨 (안전)",
-                ssh_warn_advice: "⚠️ 보안 권고: 배스천 호스트에서 비밀번호 인증이 허용되어 있습니다. 무차별 대입 공격에 대비하여 /etc/ssh/sshd_config에서 PasswordAuthentication no로 변경할 것을 강력히 권장합니다.",
+                ssh_auth_breakdown_title: "사용자별 SSH 인증 방식 분류 (Password vs Key-Only)",
+                ssh_ref_logs: "참조 데이터:",
+                ssh_key_only_title: "SSH 공개키(Key) 전용 계정",
+                badge_safe: "안전",
+                ssh_key_desc: "비밀번호 잠금/미설정으로 Key로만 접속",
+                ssh_pwd_auth_title: "비밀번호(Password) 로그인 허용 계정",
+                badge_risk: "주의",
+                ssh_pwd_desc: "비밀번호 인증 허용 (보안 점검 권장)",
+                th_privilege: "권한",
+                th_ssh_recent: "최근 SSH 인증 / 접속 IP",
                 th_inodes: "아이노드 (Inodes)",
                 th_iuse: "아이노드 사용률",
                 timers_title: "⏰ 백그라운드 스케줄러 타이머 (systemctl list-timers)",
@@ -3263,9 +3864,23 @@ class HTMLReportGenerator:
                 conn_type_remote: "🌐 원격 서버",
                 conn_type_local: "🔄 로컬 루프백",
                 no_conns: "활성 네트워크 연결이 없습니다.",
-                sysctl_title: "⚡ 핵심 커널 네트워크 & 메모리 튜닝 (sysctl)",
+                sysctl_title: "⚡ 커널 파라미터 전체 (sysctl -a)",
+                filter_sysctl: "파라미터 검색...",
+                th_sysctl_key: "커널 파라미터 (Key)",
+                th_sysctl_val: "설정값 (Value)",
+                raw_files_title: "📁 진단 수집 원본 파일 뷰어 (Diagnostic Raw Files)",
+                raw_files_desc: "sosreport 아카이브 내에서 수집된 진단 파일의 원본 텍스트를 직접 열람할 수 있습니다.",
+                btn_copy_raw: "📋 내용 복사",
+                dmesg_raw_toggle: "📄 dmesg 전체 원본 로그 열람",
+                journal_raw_toggle: "📄 journalctl 전체 원본 로그 열람",
                 anomaly_header: "🔍 커널 오류 & 비정상 이벤트 자동 스캐너",
-                anomaly_desc: "OOM Killer, 세그멘테이션 폴트, 블록 디바이스 I/O 에러 감지 결과"
+                anomaly_desc: "OOM Killer, 세그멘테이션 폴트, 블록 디바이스 I/O 에러 감지 결과",
+                core_services_title: "🚀 핵심 구동 서비스 및 미들웨어 스택 분석",
+                th_svc_name: "서비스 / 데몬",
+                th_svc_role: "인프라 역할 및 분류",
+                th_svc_port: "바인딩 포트 & 프로토콜",
+                th_svc_status: "실행 상태",
+                th_svc_security: "보안 및 운영 진단 비고"
             }},
             en: {{
                 theme_light: "Light Mode",
@@ -3299,7 +3914,7 @@ class HTMLReportGenerator:
                 tab_network: "🌐 Network & Ports",
                 tab_processes: "📈 Processes",
                 tab_logs: "📜 Logs & Kernel",
-                tab_raw: "🔍 Raw JSON",
+                tab_raw: "📁 Raw Data & Files",
                 diag_assessment: "System Diagnostic Assessment",
                 host_details: "Host & Environment Details",
                 recent_logins: "Recent User Logins (wtmp)",
@@ -3334,7 +3949,7 @@ class HTMLReportGenerator:
                 ports_title: "Active Listening Ports (netstat)",
                 top_cpu_title: "Top CPU Consumers",
                 top_mem_title: "Top Memory Consumers",
-                all_procs_title: "Active Processes (Top Resource Usage)",
+                all_procs_title: "All Running Processes",
                 dmesg_title: "Kernel Warnings & Critical Events (dmesg)",
                 journal_title: "Systemd Boot Journal Warnings & Errors (journalctl)",
                 raw_json_title: "Parsed Diagnostics JSON Payload",
@@ -3359,6 +3974,12 @@ class HTMLReportGenerator:
                 th_used: "Used",
                 th_avail: "Available",
                 th_use_pct: "Usage %",
+                filter_all: "All",
+                filter_active: "Active",
+                filter_inactive: "Inactive",
+                th_status: "Status",
+                user_active: "Active",
+                user_inactive: "Inactive",
                 th_user: "User",
                 th_session: "TTY / Session",
                 th_source_ip: "Source IP",
@@ -3386,7 +4007,16 @@ class HTMLReportGenerator:
                 kv_client_alive: "Session Keepalive Timeout",
                 badge_enabled_warn: "⚠️ Enabled (Risk)",
                 badge_disabled_safe: "✅ Disabled (Safe)",
-                ssh_warn_advice: "⚠️ Security Advisory: Password authentication is enabled on this Bastion host. Enforcing key-based access (`PasswordAuthentication no`) in /etc/ssh/sshd_config is strongly recommended.",
+                ssh_auth_breakdown_title: "SSH Authentication Method by User (Password vs Key-Only)",
+                ssh_ref_logs: "Reference Data:",
+                ssh_key_only_title: "SSH Key-Only Accounts",
+                badge_safe: "Safe",
+                ssh_key_desc: "Password locked/denied; Key access only",
+                ssh_pwd_auth_title: "Password Authentication Permitted Accounts",
+                badge_risk: "Attention",
+                ssh_pwd_desc: "Password login allowed (Audit recommended)",
+                th_privilege: "Privilege",
+                th_ssh_recent: "Recent SSH Auth / Client IP",
                 th_inodes: "Inodes Total",
                 th_iuse: "Inode Usage %",
                 timers_title: "⏰ Scheduled Timers (systemctl list-timers)",
@@ -3431,9 +4061,23 @@ class HTMLReportGenerator:
                 conn_type_remote: "🌐 Remote Server",
                 conn_type_local: "🔄 Local Loopback",
                 no_conns: "No active network connections found.",
-                sysctl_title: "⚡ Core Kernel Network & Memory Tuning (sysctl)",
+                sysctl_title: "⚡ All Kernel Parameters (sysctl -a)",
+                filter_sysctl: "Search parameters...",
+                th_sysctl_key: "Kernel Parameter (Key)",
+                th_sysctl_val: "Value",
+                raw_files_title: "📁 Collected Diagnostic Raw Files",
+                raw_files_desc: "Inspect verbatim text outputs of diagnostic files collected in the sosreport archive.",
+                btn_copy_raw: "📋 Copy Content",
+                dmesg_raw_toggle: "📄 View Full Raw dmesg Log",
+                journal_raw_toggle: "📄 View Full Raw journalctl Log",
                 anomaly_header: "🔍 Kernel Anomaly & Error Auto-Scanner",
-                anomaly_desc: "Automated scan for OOM Killer invocations, segmentation faults, and disk I/O errors"
+                anomaly_desc: "Automated scan for OOM Killer invocations, segmentation faults, and disk I/O errors",
+                core_services_title: "🚀 Core Services & Middleware Stack Analysis",
+                th_svc_name: "Service / Daemon",
+                th_svc_role: "Infrastructure Role",
+                th_svc_port: "Binding Port & Proto",
+                th_svc_status: "Status",
+                th_svc_security: "Security & Operational Notes"
             }}
         }};
 
@@ -3508,6 +4152,9 @@ class HTMLReportGenerator:
                     themeLabel.textContent = (lang === 'ko') ? '라이트 모드' : 'Light Mode';
                 }}
             }}
+
+            // Update expandable section toggle buttons text
+            expandableSections.forEach(sec => sec.update());
         }}
 
         function toggleLang() {{
@@ -3521,21 +4168,241 @@ class HTMLReportGenerator:
             btn.classList.add('active');
         }}
 
+        let currentUserStatusFilter = 'all';
+
+        function setUserStatusFilter(status, btn) {{
+            currentUserStatusFilter = status;
+            document.querySelectorAll('#user-status-filter-group .filter-btn').forEach(b => b.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+            filterUsersCombined();
+        }}
+
+        function filterUsersCombined() {{
+            const input = document.getElementById('user-search-input');
+            const filter = input ? input.value.toLowerCase().trim() : '';
+            const table = document.getElementById('tbl-users');
+            if (!table) return;
+            const rows = document.querySelectorAll('#tbl-users tbody tr.user-row');
+            rows.forEach(tr => {{
+                const rowStatus = tr.getAttribute('data-status') || '';
+                const statusMatch = (currentUserStatusFilter === 'all') || (rowStatus === currentUserStatusFilter);
+                const text = (tr.textContent || tr.innerText).toLowerCase();
+                const searchMatch = !filter || text.indexOf(filter) > -1;
+                tr.setAttribute('data-search-match', (statusMatch && searchMatch) ? 'true' : 'false');
+            }});
+
+            const wrapper = table.closest('.table-responsive') || table;
+            if (wrapper.__expandableSec) {{
+                wrapper.__expandableSec.update();
+            }} else {{
+                rows.forEach(tr => {{
+                    tr.style.display = tr.getAttribute('data-search-match') === 'true' ? '' : 'none';
+                }});
+            }}
+        }}
+
         function filterTable(input, tableId) {{
-            const filter = input.value.toLowerCase();
+            const filter = input.value.toLowerCase().trim();
             const table = document.getElementById(tableId);
-            const tr = table.getElementsByTagName('tr');
-            for (let i = 1; i < tr.length; i++) {{
-                const text = tr[i].textContent || tr[i].innerText;
-                tr[i].style.display = text.toLowerCase().indexOf(filter) > -1 ? '' : 'none';
+            if (!table) return;
+            const tbody = table.querySelector('tbody') || table;
+            const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => !r.querySelector('th'));
+            rows.forEach(tr => {{
+                const text = (tr.textContent || tr.innerText).toLowerCase();
+                const matches = !filter || text.indexOf(filter) > -1;
+                tr.setAttribute('data-search-match', matches ? 'true' : 'false');
+            }});
+
+            const wrapper = table.closest('.table-responsive') || table;
+            if (wrapper.__expandableSec) {{
+                wrapper.__expandableSec.update();
+            }} else {{
+                rows.forEach(tr => {{
+                    tr.style.display = tr.getAttribute('data-search-match') === 'true' ? '' : 'none';
+                }});
+            }}
+        }}
+
+        const expandableSections = [];
+
+        function initExpandableSections() {{
+            // 1. Process tables in .table-responsive
+            document.querySelectorAll('.table-responsive').forEach(wrapper => {{
+                if (wrapper.__expandableSec) return;
+                const table = wrapper.querySelector('table');
+                if (!table) return;
+                const tbody = table.querySelector('tbody') || table;
+                const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => !r.querySelector('th'));
+                if (rows.length === 1 && rows[0].querySelector('td[colspan]')) return;
+                if (rows.length <= 5) return;
+
+                setupExpandableContainer(wrapper, rows, 5, 'table');
+            }});
+
+            // 2. Process list containers (.expandable-list)
+            document.querySelectorAll('.expandable-list').forEach(container => {{
+                if (container.__expandableSec) return;
+                const items = Array.from(container.children);
+                if (items.length <= 5) return;
+
+                setupExpandableContainer(container, items, 5, 'list');
+            }});
+        }}
+
+        function setupExpandableContainer(container, items, limit, type) {{
+            const sec = {{
+                container: container,
+                items: items,
+                limit: limit || 5,
+                type: type,
+                isExpanded: false,
+                btn: null,
+                wrapper: null,
+
+                isItemMatched: function(item) {{
+                    return item.getAttribute('data-search-match') !== 'false';
+                }},
+
+                update: function() {{
+                    const matchedItems = this.items.filter(it => this.isItemMatched(it));
+                    const totalMatched = matchedItems.length;
+
+                    if (totalMatched <= this.limit) {{
+                        this.items.forEach(it => {{
+                            it.style.display = this.isItemMatched(it) ? '' : 'none';
+                        }});
+                        if (this.wrapper) this.wrapper.style.display = 'none';
+                        return;
+                    }}
+
+                    if (this.wrapper) this.wrapper.style.display = 'flex';
+
+                    if (this.isExpanded) {{
+                        this.items.forEach(it => {{
+                            it.style.display = this.isItemMatched(it) ? '' : 'none';
+                        }});
+                        this.btn.classList.add('expanded');
+                        this.btn.innerHTML = (currentLang === 'ko')
+                            ? '접기 (5개만 보기) <span class="arrow-icon">▲</span>'
+                            : 'Show Less (First 5) <span class="arrow-icon">▲</span>';
+                    }} else {{
+                        let count = 0;
+                        this.items.forEach(it => {{
+                            if (this.isItemMatched(it)) {{
+                                if (count < this.limit) {{
+                                    it.style.display = '';
+                                    count++;
+                                }} else {{
+                                    it.style.display = 'none';
+                                }}
+                            }} else {{
+                                it.style.display = 'none';
+                            }}
+                        }});
+                        const remaining = totalMatched - this.limit;
+                        this.btn.classList.remove('expanded');
+                        this.btn.innerHTML = (currentLang === 'ko')
+                            ? '더보기 (' + remaining + '개 더보기 / 전체 ' + totalMatched + '개) <span class="arrow-icon">▼</span>'
+                            : 'Show More (+' + remaining + ' / Total ' + totalMatched + ') <span class="arrow-icon">▼</span>';
+                    }}
+                }}
+            }};
+
+            const btnWrap = document.createElement('div');
+            btnWrap.className = 'expand-toggle-wrapper';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'expand-toggle-btn';
+            btn.onclick = () => {{
+                sec.isExpanded = !sec.isExpanded;
+                sec.update();
+            }};
+            btnWrap.appendChild(btn);
+            container.parentNode.insertBefore(btnWrap, container.nextSibling);
+
+            sec.btn = btn;
+            sec.wrapper = btnWrap;
+            container.__expandableSec = sec;
+            expandableSections.push(sec);
+
+            sec.update();
+        }}
+
+        // Raw files explorer logic
+        let rawFilesData = {{}};
+        try {{
+            const rawEl = document.getElementById('raw-files-json');
+            if (rawEl) {{
+                rawFilesData = JSON.parse(rawEl.textContent);
+            }}
+        }} catch (e) {{
+            console.error("Failed to parse rawFilesData", e);
+        }}
+
+        function showRawFile(key) {{
+            const viewer = document.getElementById('rawFileViewer');
+            const info = document.getElementById('rawFileInfo');
+            if (!viewer) return;
+            const content = rawFilesData[key] || '(No content or file is empty)';
+            const lines = content.split('\\n');
+            if (info) {{
+                const size = (content.length / 1024).toFixed(1);
+                info.textContent = lines.length.toLocaleString() + ' lines | ' + size + ' KB';
+            }}
+
+            const escapeHtml = (str) => {{
+                return str
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#039;');
+            }};
+            const hl = (str) => {{
+                return str
+                    .replace(/\\b(error|failed|failure|panic|oom-killer|segfault|fault|critical|alert|emerg)\\b/gi, '<span class="log-kw-err">$1</span>')
+                    .replace(/\\b(warn|warning|taint)\\b/gi, '<span class="log-kw-warn">$1</span>');
+            }};
+
+            let out = '';
+            const max = Math.min(lines.length, 3000);
+            for (let i = 0; i < max; i++) {{
+                const num = String(i + 1).padStart(4, '0');
+                const esc = escapeHtml(lines[i]);
+                out += '<div class="log-line"><span class="log-num">' + num + '</span><span class="log-text">' + hl(esc) + '</span></div>';
+            }}
+            if (lines.length > 3000) {{
+                out += '<div class="log-line" style="color: var(--text-muted); font-style: italic; padding: 6px 12px;"><span class="log-num">....</span><span class="log-text">... (' + (lines.length - 3000).toLocaleString() + ' lines omitted in browser preview. Use Copy button for full raw file) ...</span></div>';
+            }}
+            viewer.innerHTML = out;
+        }}
+
+        function copyRawFile() {{
+            const sel = document.getElementById('rawFileSelect');
+            const key = sel ? sel.value : null;
+            const textToCopy = (key && rawFilesData[key] !== undefined) ? rawFilesData[key] : (document.getElementById('rawFileViewer')?.innerText || '');
+            if (textToCopy) {{
+                navigator.clipboard.writeText(textToCopy).then(() => {{
+                    alert((currentLang === 'ko') ? '클립보드에 원본 파일 내용이 복사되었습니다!' : 'Raw file content copied to clipboard!');
+                }}).catch(err => {{
+                    console.error('Clipboard copy error:', err);
+                }});
             }}
         }}
 
         // Initialize state on DOM ready
         document.addEventListener('DOMContentLoaded', () => {{
             applyTheme(currentTheme);
+            initExpandableSections();
             applyLanguage(currentLang);
+            const rawSel = document.getElementById('rawFileSelect');
+            if (rawSel && rawSel.value) {{
+                showRawFile(rawSel.value);
+            }}
         }});
+    </script>
+    <script type="application/json" id="raw-files-json">
+        {raw_files_json}
     </script>
 </body>
 </html>
@@ -3591,7 +4458,7 @@ def main():
         parser_inst.extract_needed_files()
         parser_inst.parse_all()
 
-        generator = HTMLReportGenerator(parser_inst.data)
+        generator = HTMLReportGenerator(parser_inst.data, parser_inst.raw_files)
         html_content = generator.generate()
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
